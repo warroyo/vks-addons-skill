@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "vks-addons",
+  "description": "Domain knowledge for building, installing, and debugging VKS (vSphere Kubernetes Service) addons: the AddonConfigDefinition / AddonRepository / AddonInstall resource family. Verified against VKS 3.7.",
+  "version": "1.0.0",
+  "author": {
+    "name": "warroyo",
+    "url": "https://github.com/warroyo"
+  },
+  "homepage": "https://github.com/warroyo/vks-addons",
+  "repository": "https://github.com/warroyo/vks-addons",
+  "license": "MIT",
+  "keywords": ["vks", "vsphere", "kubernetes", "addons", "carvel", "supervisor", "tanzu", "vmware"]
+}

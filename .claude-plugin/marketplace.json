@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace-manifest.json",
+  "name": "vks-addons",
+  "owner": {
+    "name": "warroyo",
+    "url": "https://github.com/warroyo"
+  },
+  "description": "The vks-addons skill, installable as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "vks-addons",
+      "source": "./",
+      "description": "Domain knowledge for building, installing, and debugging VKS (vSphere Kubernetes Service) addons. Covers the manager-only webhooks, the AddonRepository routes, the payload-as-data pattern, the template dialect, and live verification probes.",
+      "license": "MIT",
+      "keywords": ["vks", "vsphere", "kubernetes", "addons", "carvel", "supervisor", "tanzu", "vmware"]
+    }
+  ]
+}
