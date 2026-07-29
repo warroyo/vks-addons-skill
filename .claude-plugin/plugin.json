@@ -7,8 +7,8 @@
     "name": "warroyo",
     "url": "https://github.com/warroyo"
   },
-  "homepage": "https://github.com/warroyo/vks-addons",
-  "repository": "https://github.com/warroyo/vks-addons",
+  "homepage": "https://github.com/warroyo/vks-addons-skill",
+  "repository": "https://github.com/warroyo/vks-addons-skill",
   "license": "MIT",
   "keywords": ["vks", "vsphere", "kubernetes", "addons", "carvel", "supervisor", "tanzu", "vmware"]
 }

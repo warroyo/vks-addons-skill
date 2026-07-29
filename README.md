@@ -33,14 +33,14 @@ tested, the skill says so.
 As a Claude Code plugin, from GitHub:
 
 ```
-/plugin marketplace add warroyo/vks-addons
+/plugin marketplace add warroyo/vks-addons-skill
 /plugin install vks-addons@vks-addons
 ```
 
 Or from a local clone:
 
 ```
-/plugin marketplace add /path/to/vks-addons
+/plugin marketplace add /path/to/vks-addons-skill
 /plugin install vks-addons@vks-addons
 ```
 
@@ -50,7 +50,7 @@ Then reload plugins (`/reload-plugins`) or restart. Invoke it directly with
 ## Layout
 
 ```
-vks-addons/
+vks-addons-skill/
 ├── .claude-plugin/
 │   ├── plugin.json         # plugin manifest
 │   └── marketplace.json    # marketplace manifest (this repo is its own marketplace)

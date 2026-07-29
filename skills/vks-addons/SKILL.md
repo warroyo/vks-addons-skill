@@ -203,8 +203,8 @@ You can learn a lot without a full build/upload cycle.
 
 ## Reference implementation
 
-`warroyo/bootstrap-addon-service` is a worked example: a generic "apply arbitrary YAML at
+`warroyo/dayzero-addon-service` is a worked example: a generic "apply arbitrary YAML at
 provisioning" addon built as an imgpkg AddonRepository with a hand-written ACD and a native
 render package, plus a Supervisor Service wrapper and both install methods. Its
-`docs/future-direct-creation.md` records the package-free/fetch-free design that the
-manager-only webhooks block today.
+`docs/design.md` records the package-free design (see *Package-free addons are legal* and
+*Alternatives rejected*), and `docs/verify.md` records the probes it was checked with.
