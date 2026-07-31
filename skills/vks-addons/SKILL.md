@@ -24,13 +24,88 @@ sometimes stale.
 
 ## The resource model
 
-Seven kinds under `addons.kubernetes.vmware.com`, in two groups.
+Eight kinds under `addons.kubernetes.vmware.com`, in three groups. Red is manager-owned
+and webhook-locked, blue is tenant-created, green is inside the workload cluster.
+
+```mermaid
+flowchart TB
+  BUNDLE["imgpkg bundle: Carvel package repository<br/>one PackageMetadata + Package per version<br/><i>or</i> a Helm chart repository"]
+
+  subgraph admin["Admin applies, once per Supervisor"]
+    REPO["<b>AddonRepository</b><br/>spec.fetch.imgpkgBundle<br/><i>or</i> spec.fetch.helmRepository<br/>annot: package-offerings"]
+    RINST["<b>AddonRepositoryInstall</b><br/>spec.addonRepositoryRef"]
+  end
+
+  MGR{{"VKS addon manager<br/><i>the only identity the validating<br/>webhooks let create Addon / AddonRelease</i>"}}
+
+  subgraph public["ns: vmware-system-vks-public, manager-owned"]
+    ADDON["<b>Addon</b><br/>&lt;addon-name&gt;<br/>groups releases · displayName"]
+    REL["<b>AddonRelease</b><br/>binds Addon to an ACD version<br/>kubernetesVersionConstraints<br/>spec.package"]
+    ACD["<b>AddonConfigDefinition</b><br/>openAPIV3Schema<br/>templateInputResources<br/>templateOutputResources"]
+    PKG["<b>Package</b> (Carvel)<br/>annot: addon-config-definition<br/>hand-written ACD, gzip+base64"]
+  end
+
+  subgraph tenant["ns: the cluster's Supervisor namespace, tenant-owned"]
+    AINST["<b>AddonInstall</b><br/>spec.addonRef → Addon<br/>spec.clusters[].selector<br/>stopMatchingBehavior"]
+    ACFG["<b>AddonConfig</b><br/>name MUST be &lt;cluster&gt;-&lt;addon&gt;<br/>spec.values, validated by the ACD schema<br/>annot: owned-for-deletion"]
+    INPUT["ConfigMap / Cluster / …<br/><i>resolved templateInputResource</i>"]
+    CLUSTER["<b>Cluster</b><br/>carries the selector label"]
+    CADDON(["<b>ClusterAddon</b><br/>one per matched cluster<br/>reports template + reconcile errors"])
+    SSEC["supervisorNamespaceOutput<br/>Secret, referenceType: ValuesRef"]
+  end
+
+  subgraph guest["Guest cluster"]
+    GSEC["targetClusterOutput<br/>Secret in the package namespace"]
+    PI["<b>PackageInstall</b><br/>annot: addoninstall-name"]
+    RENDER["Package render: ytt<br/>reads the data values"]
+    HELM["HelmRelease<br/>helm-controller applies the chart"]
+    PAYLOAD["The addon's resources, in the cluster"]
+  end
+
+  BUNDLE -.->|fetched by| REPO
+  REPO --> RINST
+  RINST ==>|triggers| MGR
+  MGR ==>|creates| ADDON
+  MGR ==>|creates| REL
+  MGR ==>|"creates (imgpkg flavour)"| PKG
+  PKG -.->|annotation decoded| ACD
+  MGR ==>|"creates: hand-written via imgpkg,<br/>generated from the chart via helm"| ACD
+
+  ADDON --- REL
+  REL -->|configDefinitionRef| ACD
+
+  AINST -->|addonRef| ADDON
+  AINST -->|label selector matches| CLUSTER
+  AINST --> CADDON
+  CLUSTER --> CADDON
+  ACFG -->|"values, matched by name"| CADDON
+  INPUT -.->|dependency| CADDON
+  ACD -->|"Go template + sprig,<br/>evaluated per cluster"| CADDON
+
+  CADDON ==>|renders| SSEC
+  CADDON ==>|renders| GSEC
+  REL -.->|"spec.package (imgpkg flavour)"| PI
+  SSEC -->|ValuesRef| PI
+  GSEC -->|data values| PI
+  PI --> RENDER --> PAYLOAD
+  REL -.->|helm flavour| HELM
+  HELM --> PAYLOAD
+
+  classDef locked fill:#fde2e2,stroke:#c0392b,color:#111
+  classDef tenantc fill:#e3f2fd,stroke:#1565c0,color:#111
+  classDef guestc fill:#e8f5e9,stroke:#2e7d32,color:#111
+  class ADDON,REL locked
+  class AINST,ACFG,CADDON,INPUT tenantc
+  class GSEC,PI,RENDER,HELM,PAYLOAD guestc
+```
 
 Manager-owned, created for you, live in `vmware-system-vks-public`:
 
-- **AddonConfigDefinition (ACD)**: the addon's schema (`openAPIV3Schema`) plus
-  `templateOutputResources` (what it renders per cluster) and optional
-  `templateInputResources` (things it reads, like a Cluster CR or a ConfigMap).
+- **AddonConfigDefinition (ACD)**: the addon's contract. `openAPIV3Schema` is the
+  tenant-facing values schema; `templateOutputResources` is what it renders per cluster;
+  optional `templateInputResources` declares Supervisor objects to read (a `ConfigMap`,
+  the `Cluster`); `spec.addonInstallPermission.accessPolicies` grants the rights for those
+  reads and writes.
 - **Addon**: groups releases of one addon. Mostly metadata (`displayName`, `description`).
 - **AddonRelease**: binds an `Addon` to an `AddonConfigDefinition` version, carries
   `kubernetesVersionConstraints`, and may carry `spec.package`. If it has `spec.package`,
@@ -43,10 +118,19 @@ Admin- or tenant-creatable, the levers you actually pull:
   them created (see constraints).
 - **AddonInstall**: a tenant attaches an addon to clusters via a label selector.
   References the `Addon` by `spec.addonRef`. Created in the cluster's Supervisor namespace.
-- **AddonConfig**: per-cluster values. Must be named `<cluster-name>-<addon-name>`, in the
-  cluster's Supervisor namespace, with annotation
+  `stopMatchingBehavior` decides whether the addon's resources are removed or left behind
+  when a cluster stops matching the selector.
+- **AddonConfig**: per-cluster values, validated against the ACD schema. Must be named
+  `<cluster-name>-<addon-name>` — that name is how the system pairs config to cluster — in
+  the cluster's Supervisor namespace, with annotation
   `clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"` so it is garbage
   collected with the ClusterAddon.
+
+Created for you per matched cluster, and the thing to actually debug:
+
+- **ClusterAddon**: one per cluster the `AddonInstall` selector matched. This is where the
+  ACD's output templates evaluate, against that cluster's `AddonConfig`, so template errors
+  surface in *its* conditions, per cluster, rather than anywhere upstream.
 
 ## The hard constraints (the expensive lessons)
 
@@ -65,7 +149,23 @@ operation on an AddonRelease is only allowed from VKS addon manager service acco
 
 **AddonConfigDefinition is NOT locked, but it is inert alone.** You can create an ACD
 directly, but nothing consumes one that is not selected by an AddonRelease, and an
-AddonInstall requires the Addon to reconcile. So authoring only the ACD gets you nothing.
+AddonInstall requires the Addon to reconcile ("The Addon must be created to reconcile the
+AddonInstall"), with no field pointing at an ACD. So authoring only the ACD gets you
+nothing.
+
+*This is what blocks the package-free, fetch-free design*, which is otherwise the better
+one and worth knowing about: a Supervisor Service lays down the ACD, the Addon, and an
+AddonRelease carrying `addonConfigDefinitionRef` and **no `spec.package`**, with the last
+`templateOutputResource` being a kapp-controller `App` with an `inline` fetch carrying the
+payload. Tenants attach it with AddonInstall + AddonConfig exactly as normal. No Carvel
+package, no guest image pull, no registry in the path at all. Every piece of it works
+today except creating the Addon and AddonRelease.
+
+It becomes viable if any of: the webhook is relaxed to admit RBAC-authorized callers; a
+supported path appears for a non-manager principal to create a package-free Addon +
+AddonRelease; or AddonInstall gains a direct ACD reference, removing the need for both.
+Re-test with the token probe below — if a non-manager service account can create an
+AddonRelease, the design is back on the table.
 
 **The only route to create the three kinds is an AddonRepository.** Two flavours:
 
@@ -78,6 +178,15 @@ AddonInstall requires the Addon to reconcile. So authoring only the ACD gets you
   (helm only) narrows which charts and versions off the upstream index get reconciled —
   `[{name: external-secrets, versions: ["2.8.0"]}]` against `https://charts.external-secrets.io`.
   It selects; it does not exempt the repository from the `package-offerings` annotation.
+
+| | `imgpkgBundle` | `helmRepository` |
+|---|---|---|
+| ACD | yours, shipped in the `Package` annotation as gzip+base64 | generated from the chart, fixed `helmValues`/`helmOptions` schema |
+| Tenant API | whatever schema you write | helm values |
+| Guest mechanism | `PackageInstall` -> ytt -> kapp | `HelmRelease` via helm-controller |
+| `AddonRelease.spec.package` | set | not set |
+| Dependencies | kapp-controller only | helm-controller must be installed |
+| Version selection | the versions in the bundle | `spec.addonFilters` |
 
 **An AddonRepository is frozen once an AddonRepositoryInstall references it.**
 `addonrepositories.validating.vmware.com` permits only `spec.addonFilters` to be modified
@@ -199,6 +308,18 @@ it in the ACD and decode in the package. E.g. structured resources as
 `{{ .Values.resources | toJson | toJson }}` -> a JSON string; the package does
 `json.decode`. Raw multi-doc YAML as `{{ $raw | toJson }}`; the package splits on the doc
 separator and `yaml.decode`s each.
+
+**`addonInstallPermission` is Supervisor-side only.** `spec.addonInstallPermission.
+accessPolicies` on the ACD grants the addon controller rights *in the cluster's Supervisor
+namespace* — reading `templateInputResources` and writing the output Secret — and says
+nothing about the guest. Declare what your outputs and inputs actually touch; the shipped
+cilium ACD declares `get`/`list`/`watch` on configmaps plus full access to secrets, which
+is the usual shape.
+
+In the guest, the payload is applied by the `PackageInstall` identity the addon system
+owns, which is privileged enough to install cluster addons. An addon author does not get
+to choose that identity or scope it down — if a configurable ClusterRole matters, the
+addon system is the wrong delivery mechanism for that payload.
 
 ## Output templates are the resource body only
 
