@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "vks-addons",
   "description": "Domain knowledge for building, installing, and debugging VKS (vSphere Kubernetes Service) addons: the AddonConfigDefinition / AddonRepository / AddonInstall resource family. Verified against VKS 3.7.",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": {
     "name": "warroyo",
     "url": "https://github.com/warroyo"
