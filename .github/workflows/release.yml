@@ -1,0 +1,147 @@
+name: Release
+
+# Consumers install this plugin from the default branch, so the version bump
+# only takes effect once it lands back on main. Tags and GitHub releases are
+# for humans; main is what `claude plugin update` actually reads.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # The bump commit is pushed with GITHUB_TOKEN, which does not retrigger
+    # workflows. The marker is belt-and-braces for manual pushes.
+    if: "!contains(github.event.head_commit.message, '[skip release]')"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate manifests
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude plugin validate . --strict
+
+      - name: Decide bump level
+        id: level
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Scan every commit in the push, not just the head, so a "#minor"
+          # buried mid-push is not lost behind a later docs commit.
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            messages=$(git log --format=%B "$BEFORE..$AFTER")
+          else
+            messages=$(git log -1 --format=%B "$AFTER")
+          fi
+
+          if grep -qiF '#major' <<<"$messages"; then
+            level=major
+          elif grep -qiF '#minor' <<<"$messages"; then
+            level=minor
+          else
+            level=patch
+          fi
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+          echo "Bump level: $level"
+
+      - name: Bump version
+        id: bump
+        env:
+          LEVEL: ${{ steps.level.outputs.level }}
+        run: |
+          set -euo pipefail
+          manifest=.claude-plugin/plugin.json
+          market=.claude-plugin/marketplace.json
+          name=$(jq -r '.name' "$manifest")
+          current=$(jq -r '.version' "$manifest")
+
+          if ! [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version '$current' in $manifest is not bare semver" >&2
+            exit 1
+          fi
+
+          IFS=. read -r major minor patch <<<"$current"
+          case "$LEVEL" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="$major.$minor.$patch"
+
+          # Rewrite the version line in place rather than piping through jq,
+          # which would reflow hand-formatted arrays and bury the real change.
+          set_version() {
+            local file=$1 value=$2 hits
+            hits=$(grep -cE '^[[:space:]]*"version"[[:space:]]*:' "$file" || true)
+            if [ "$hits" != "1" ]; then
+              echo "::error::expected exactly 1 version line in $file, found $hits" >&2
+              exit 1
+            fi
+            sed -i -E "s|^([[:space:]]*\"version\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")|\1$value\2|" "$file"
+            if [ "$(jq -r '.. | objects | select(has("version")) | .version' "$file" | head -1)" != "$value" ]; then
+              echo "::error::rewrite of $file did not take" >&2
+              exit 1
+            fi
+          }
+
+          set_version "$manifest" "$next"
+
+          # `claude plugin tag` fails if a marketplace entry carries a version
+          # that disagrees with plugin.json. Ours omits it today; keep them in
+          # step if one is ever added.
+          if [ "$(jq --arg n "$name" 'any(.plugins[]; .name == $n and has("version"))' "$market")" = "true" ]; then
+            set_version "$market" "$next"
+          fi
+
+          {
+            echo "name=$name"
+            echo "current=$current"
+            echo "next=$next"
+            echo "tag=$name--v$next"
+          } >> "$GITHUB_OUTPUT"
+          echo "$current -> $next"
+
+      - name: Commit, tag and push
+        env:
+          NAME: ${{ steps.bump.outputs.name }}
+          NEXT: ${{ steps.bump.outputs.next }}
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git add .claude-plugin
+          git commit -m "chore(release): $NAME $NEXT [skip release]"
+          git tag -a "$TAG" -m "$NAME $NEXT"
+
+          # Atomic: if the tag push loses a race, main does not move either.
+          git push --atomic origin HEAD:main "refs/tags/$TAG"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ steps.bump.outputs.name }}
+          NEXT: ${{ steps.bump.outputs.next }}
+          TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$NAME $NEXT" \
+            --generate-notes \
+            --verify-tag

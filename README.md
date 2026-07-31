@@ -65,10 +65,43 @@ vks-addons-skill/
 ├── .claude-plugin/
 │   ├── plugin.json         # plugin manifest
 │   └── marketplace.json    # marketplace manifest (this repo is its own marketplace)
+├── .github/
+│   └── workflows/
+│       └── release.yml     # version bump, tag and release on push to main
 └── skills/
     └── vks-addons/
         └── SKILL.md        # the skill
 ```
+
+## Releasing
+
+`claude plugin update` compares the `version` in `plugin.json`, not the commit sha. Push
+new commits without bumping it and the update is a silent no-op, leaving everyone on a
+stale copy of the skill.
+
+So the bump is automated. Any push to `main` that touches something other than
+`.github/**` validates the manifests, bumps the patch version, commits that back to
+`main`, tags `vks-addons--v<version>` and cuts a GitHub release. Nothing to remember —
+just push.
+
+For a larger bump, put `#minor` or `#major` anywhere in a commit message in the push:
+
+```
+git commit -m "feat: cover AddonConfig precedence #minor"
+```
+
+Every commit in the push is scanned, not just the last one, and the marker is
+case-insensitive. The largest one wins.
+
+Consumers install from the default branch, so the bump commit landing on `main` is what
+makes an update visible; the tag and release are for humans. To pick up a release:
+
+```
+claude plugin marketplace update vks-addons
+claude plugin update vks-addons@vks-addons
+```
+
+Then restart, since skills load at session start.
 
 ## License
 
