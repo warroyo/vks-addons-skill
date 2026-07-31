@@ -10,7 +10,7 @@
     {
       "name": "vks-addons",
       "source": "./",
-      "description": "Domain knowledge for building, installing, and debugging VKS (vSphere Kubernetes Service) addons. Covers the manager-only webhooks, the AddonRepository routes, the payload-as-data pattern, the template dialect, and live verification probes.",
+      "description": "Domain knowledge for building, installing, and debugging VKS (vSphere Kubernetes Service) addons. Covers the manager-only webhooks, the AddonRepository routes, repository versioning and immutability, the payload-as-data pattern, the template dialect, and live verification probes.",
       "license": "MIT",
       "keywords": ["vks", "vsphere", "kubernetes", "addons", "carvel", "supervisor", "tanzu", "vmware"]
     }
