@@ -24,7 +24,7 @@ jobs:
     if: "!contains(github.event.head_commit.message, '[skip release]')"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -49,9 +49,16 @@ jobs:
             messages=$(git log -1 --format=%B "$AFTER")
           fi
 
-          if grep -qiF '#major' <<<"$messages"; then
+          # Match a whole-line trailer, never a substring. An inline marker like
+          # "#major" also fires when a commit message merely mentions it in prose
+          # (documenting the convention is enough), which is how the very first
+          # run of this workflow cut 2.0.0 instead of 1.0.1.
+          trailer() {
+            grep -qiE "^[[:space:]]*Release:[[:space:]]*$1[[:space:]]*$" <<<"$messages"
+          }
+          if trailer major; then
             level=major
-          elif grep -qiF '#minor' <<<"$messages"; then
+          elif trailer minor; then
             level=minor
           else
             level=patch

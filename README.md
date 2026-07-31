@@ -84,14 +84,18 @@ So the bump is automated. Any push to `main` that touches something other than
 `main`, tags `vks-addons--v<version>` and cuts a GitHub release. Nothing to remember —
 just push.
 
-For a larger bump, put `#minor` or `#major` anywhere in a commit message in the push:
+For a larger bump, add a `Release:` trailer on its own line in a commit message:
 
 ```
-git commit -m "feat: cover AddonConfig precedence #minor"
+git commit -m "feat: cover AddonConfig precedence
+
+Release: minor"
 ```
 
-Every commit in the push is scanned, not just the last one, and the marker is
-case-insensitive. The largest one wins.
+Every commit in the push is scanned, not just the last one. The trailer is
+case-insensitive and the largest one in the push wins. It has to be a line of its own —
+mentioning `Release: minor` mid-sentence in prose does nothing, which is deliberate: an
+inline marker fires whenever a commit message merely talks about the convention.
 
 Consumers install from the default branch, so the bump commit landing on `main` is what
 makes an update visible; the tag and release are for humans. To pick up a release:
