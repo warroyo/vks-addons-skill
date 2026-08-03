@@ -284,6 +284,60 @@ created in a service namespace, so a thin Supervisor Service wrapping those two 
   next to `addonFilters: [{name: external-secrets, versions: ["2.8.0"]}]`). For a helm
   repository the offerings keys are chart names, not Carvel package refs.
 
+## What package-offerings gates: the AddonRepositoryInstall validator
+
+Unenforced against bundle contents at reconcile time (above) does not mean unenforced,
+full stop. A separate validating-webhook layer on AddonRepositoryInstall reads
+`package-offerings` actively at create/update/delete. Sourced from the validator's
+functions, not independently live-tested here the way the rest of this file is — treat the
+call sites as documented, not measured:
+
+- **Duplicate detection on create** (`validateNoDuplicateStdPackageARI` /
+  `FindExistingStdPackageARI`). If the target AddonRepository lacks the internal
+  `pkgr-type=vks-addons` label, the validator falls back to comparing `package-offerings`
+  (via `EqualPackageOfferings` — structural equality, key/array order ignored) against every
+  other installed repo. A match blocks creation as a duplicate. This is the hook a
+  third-party repository gets without the internal label: declare the same `packages`
+  content as an existing repo and you are recognized as equivalent, same as if it were a
+  VKS-owned one.
+- **Version-compatibility on update** (`validateStdPackageSameVersion`). Repointing an ARI's
+  `addonRepositoryRef` at a different AddonRepository diffs old vs. new
+  `package-offerings`; content that doesn't match rejects the update. Either side omitting
+  the annotation skips the check — the same graceful degradation as reconciliation.
+- **Conflict with Helm-based Addons** (`validateHelmAddonConflict`). Package names in the
+  annotation are parsed with `ExtractPackagePrefix` (substring before the first `.`) into
+  addon names and checked against existing Helm-based `Addon` resources in the namespace —
+  blocks installing a Carvel package that would collide by name with an already-installed
+  Helm addon.
+- **Removal-in-use protection on update** (`validatePackagesMetadataDiff` / `DiffRemoved` ->
+  `validateRemovedPackagesNotInUse`). Diffs old vs. new annotation for package/version combos
+  that were dropped. For anything dropped and not listed under `removedExceptionPackages` /
+  `removedExceptionVersions`, checks whether a live `ClusterAddon` still references the
+  AddonRelease named `<package>.<version>` (`+` swapped for `-`) and blocks the update if so.
+- **Deletion protection** (`validateNoPackageInUseForARIDelete`). The same in-use check runs
+  at ARI delete time, against every package/version the annotation lists.
+
+Takeaway for a third-party AddonRepository author: these checks are what you buy by keeping
+the annotation accurate, not the manager's reconcile behavior.
+
+- List every installable package under `packages.<name>.versions`, named to match the
+  `<name>.<version>` (`+` -> `-`) AddonRelease convention — that's the identity the in-use
+  checks key on.
+- A version you stop serving must either stay served or move to
+  `removedExceptionPackages` / `removedExceptionVersions` — otherwise your *own* next update
+  is the one the webhook blocks.
+- A structurally identical `packages` block in another repository *will* collide with you on
+  create/update. That's the intended duplicate-detection behavior, not a bug to route
+  around — pick a `packages` shape only you serve if you don't want to be treated as a mirror
+  of someone else's catalog.
+- The individual checks above degrade gracefully if an annotation is missing on either side
+  (e.g. the update/delete comparisons just skip), which reads as defensive coding against
+  objects from before the annotation was required — it does not mean you can skip the
+  annotation now. The AddonRepository-create check (above: "Not found" on either fetch
+  flavour) already forces it on every new object, and skipping the check is exactly the
+  scenario that loses duplicate detection and update/delete in-use protection, so the
+  practical guidance is the same: keep it, and keep it accurate.
+
 ## Delivery: the ACD-in-annotation and payload-as-data patterns
 
 **A hand-written ACD ships inside a Package.** Put the full AddonConfigDefinition YAML into
