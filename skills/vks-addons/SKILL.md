@@ -10,7 +10,8 @@ description: >-
   helm AddonRepositories, or troubleshooting why addon resources will not create or
   reconcile. Covers the manager-only webhooks, the immutability of an installed
   AddonRepository, the package-offerings annotation, the payload-as-data pattern, the
-  template dialect, and live verification probes.
+  template dialect, cross-addon dependencies (dependsOn and ClusterAddon template
+  inputs), and live verification probes.
 metadata:
   source: empirical, verified against VKS 3.7 (Supervisor + guest)
 ---
@@ -48,7 +49,7 @@ flowchart TB
   subgraph tenant["ns: the cluster's Supervisor namespace, tenant-owned"]
     AINST["<b>AddonInstall</b><br/>spec.addonRef → Addon<br/>spec.clusters[].selector<br/>stopMatchingBehavior"]
     ACFG["<b>AddonConfig</b><br/>name MUST be &lt;cluster&gt;-&lt;addon&gt;<br/>spec.values, validated by the ACD schema<br/>annot: owned-for-deletion"]
-    INPUT["ConfigMap / Cluster / …<br/><i>resolved templateInputResource</i>"]
+    INPUT["ConfigMap / Cluster / another ClusterAddon<br/><i>resolved templateInputResource</i>"]
     CLUSTER["<b>Cluster</b><br/>carries the selector label"]
     CADDON(["<b>ClusterAddon</b><br/>one per matched cluster<br/>reports template + reconcile errors"])
     SSEC["supervisorNamespaceOutput<br/>Secret, referenceType: ValuesRef"]
@@ -104,12 +105,13 @@ Manager-owned, created for you, live in `vmware-system-vks-public`:
 - **AddonConfigDefinition (ACD)**: the addon's contract. `openAPIV3Schema` is the
   tenant-facing values schema; `templateOutputResources` is what it renders per cluster;
   optional `templateInputResources` declares Supervisor objects to read (a `ConfigMap`,
-  the `Cluster`); `spec.addonInstallPermission.accessPolicies` grants the rights for those
-  reads and writes.
+  the `Cluster`, another addon's `ClusterAddon`); `spec.addonInstallPermission.accessPolicies`
+  grants the rights for those reads and writes.
 - **Addon**: groups releases of one addon. Mostly metadata (`displayName`, `description`).
 - **AddonRelease**: binds an `Addon` to an `AddonConfigDefinition` version, carries
   `kubernetesVersionConstraints`, and may carry `spec.package`. If it has `spec.package`,
-  the guest gets a PackageInstall; if not, the addon is package-free.
+  the guest gets a PackageInstall; if not, the addon is package-free. `spec.dependsOn`
+  gates install on other addons being installed (see *Cross-addon dependencies*).
 
 Admin- or tenant-creatable, the levers you actually pull:
 
@@ -393,10 +395,96 @@ Helm-style `toYaml`/`fromYaml`, which the controller registers although they are
 Context roots:
 
 - `.Values.<field>` (capital V): the AddonConfig values, defaulted from the ACD schema.
-- `.Dependencies.<inputName>`: a resolved `templateInputResource` (the whole object).
+- `.Dependencies.<inputName>`: a resolved `templateInputResource` (the whole object). Use
+  `index .Dependencies "<inputName>"` when the input name contains a hyphen. A
+  `templateInputResource`'s own `name` and `selector` values are themselves templatable
+  against previously resolved inputs; the controller topologically sorts them, and a
+  circular or self-reference is rejected at admission.
 - `.Cluster` (e.g. `.Cluster.name`) and `.Addon`.
 
 The Package's own guest-side render is **ytt** (`json`, `yaml`, `data` modules useful).
+
+## Cross-addon dependencies: two mechanisms, and the gap between them
+
+An addon that needs *another addon* — its CRDs, its webhook — has two places to say so.
+They do different jobs, and shipped addons use both, sometimes neither.
+
+**1. `AddonRelease.spec.dependsOn` — the install gate.** Manager-owned, so it comes from
+what you publish. Per the CRD: *"AddonRelease install will check if all addons in DependsOn
+are installed on the Kubernetes cluster before installing"*, and its own example is contour
+depending on cert-manager. Live survey of a VKS 3.7 Supervisor — 10 of 104 AddonReleases
+declare one:
+
+| addon | `dependsOn` |
+|---|---|
+| contour (4 versions) | cert-manager |
+| windows-gmsa-webhook (4 versions) | cert-manager |
+| external-secrets 2.8.0 | helm-controller |
+| application 9.0.0 | helm-controller |
+
+Unsatisfied, the ClusterAddon reports `dependency "<name>" not installed`.
+
+The check is for the **addon** being installed. A component delivered any other way — a
+Carvel `PackageInstall` you sync yourself, a helm release, `kubectl apply` — does not
+satisfy it, however genuinely present it is in the cluster. So if your platform installs
+cert-manager outside the addon system, every addon carrying `dependsOn: cert-manager` is
+unsatisfiable no matter how healthy cert-manager is.
+
+**2. A `ClusterAddon` `templateInputResource` — the data dependency.** Reads another
+addon's ClusterAddon into the template context:
+
+```yaml
+templateInputResources:
+- apiVersion: addons.kubernetes.vmware.com/v1alpha1
+  kind: ClusterAddon
+  name: '{{.Cluster.name}}-cert-manager'
+  inputName: certManagerAddon
+  constraints: [{operator: optional}]
+```
+
+`constraints[].operator` is an enum of exactly three, and the default is the important one:
+
+| operator | behaviour |
+|---|---|
+| *omitted* / `unique` | exactly one match required; **if the dependency is not available, reconciliation stops** |
+| `optional` | resolution continues when the target is not found |
+| `multiple` | multiple matches allowed, stored as an array in the template context |
+
+So a **required** cross-addon input is written by *omitting* `constraints` — that is the
+ordering barrier. (Stated twice in the CRD; not independently live-tested here.)
+
+**The gap, and why it bites.** headlamp is the only shipped ACD using the ClusterAddon-input
+idiom (`certManagerAddon`, `prometheusAddon`) and it marks **both `optional`**. It also
+declares **no `dependsOn`**. But its chart defaults to cert-manager-issued TLS for itself
+(`tls.certManager.enabled: true`, `issuer.create: true`), so it renders a
+`cert-manager.io/v1/Issuer` unconditionally. On a cluster where cert-manager is not an
+addon, nothing gates the install and it dies in the payload:
+
+```
+kapp: Error: Expected to find kind 'cert-manager.io/v1/Issuer', but did not:
+- No matching CRD was found in given configuration
+```
+
+The ClusterAddon sits `Ready: False` and the kapp failure is **one-shot** — nothing
+re-drives it when cert-manager shows up later. Meanwhile the template's
+`installedAddons` renders `[]`, which is the value that would have enabled headlamp's
+cert-manager UI plugin.
+
+Three rules fall out:
+
+- **Debugging:** when an addon fails on a missing CRD, decode its ACD and read
+  `templateInputResources` *first*. That is where the vendor states what else it expects,
+  and it is visible only inside the gzip+base64 `addon-config-definition` annotation on the
+  Carvel `Package` — not on the `Addon`, and not on the `AddonRelease`, whose `dependsOn`
+  may be empty even when a real dependency exists.
+- **Authoring:** if your addon needs another addon, declare it **both** ways — `dependsOn`
+  for the install gate, plus a constraint-less `templateInputResources` entry if you also
+  read from it. Letting the payload fail loudly is what headlamp does, and it fails in a
+  way that never retries.
+- **Platform:** deliver interdependent components through **one** mechanism. Splitting them
+  (cert-manager via your own GitOps/Carvel, headlamp via the addon system) leaves nothing to
+  order them and nothing to retry, and it silently defeats `dependsOn` for every addon that
+  uses it.
 
 ## Building an imgpkg addon-repository bundle
 
@@ -565,11 +653,25 @@ You can learn a lot without a full build/upload cycle.
   ```sh
   kubectl -n <cluster-ns> get secret <cluster>-kubeconfig -o jsonpath='{.data.value}' | base64 -d > guest.kubeconfig
   ```
-- **Decode a shipped ACD** to use as a reference implementation:
+- **Decode a shipped ACD** to use as a reference implementation, or to find out what an
+  addon expects to be present (`templateInputResources`) before debugging further:
   ```sh
   kubectl -n vmware-system-vks-public get package <pkg> \
     -o jsonpath='{.metadata.annotations.addons\.kubernetes\.vmware\.com/addon-config-definition}' \
     | base64 -d | gunzip
+  ```
+- **Find every declared cross-addon dependency** on the Supervisor — the fastest read of
+  which addons the catalog expects to be installed as addons:
+  ```sh
+  kubectl -n vmware-system-vks-public get addonrelease -o json | jq -r '.items[]
+    | select(.spec.dependsOn) | "\(.metadata.name) -> \([.spec.dependsOn[].addonRef.name])"'
+  ```
+  And the softer, data-level form (a `ClusterAddon` read as template input), which requires
+  decoding each ACD:
+  ```sh
+  kubectl -n vmware-system-vks-public get addonconfigdefinition -o json | jq -r '.items[]
+    | .metadata.name as $n | (.spec.templateInputResources // [])[]
+    | select(.kind=="ClusterAddon") | "\($n): \(.inputName) -> \(.name) \(.constraints)"'
   ```
 - **Test the guest render** directly: create an inline-fetch kapp-controller `App`, or a
   `Package` + `PackageInstall` with inline content and a values Secret, in a scratch guest
@@ -611,6 +713,14 @@ You can learn a lot without a full build/upload cycle.
   `package-offerings`): **you cannot**. Ship a new pair with a new name and
   `targetRepositoryName`, then delete the old one — or avoid needing to, per the previous
   bullet.
+- Your addon needs another addon (its CRDs, its webhook): declare `dependsOn` on the
+  AddonRelease for the install gate, **and** a `templateInputResources` entry with
+  `constraints` omitted if you also read from it. Do not rely on the payload failing —
+  a kapp CRD-missing failure is one-shot and never retries.
+- Deciding how to install a component that other addons declare `dependsOn` on
+  (cert-manager is the common one): install it **as an addon**. `dependsOn` checks for the
+  addon, so cert-manager delivered by your own GitOps or a Carvel `PackageInstall` leaves
+  contour and windows-gmsa-webhook permanently unsatisfiable.
 - Tempted to create the Addon/AddonRelease yourself (Job, controller, apply): **do not**,
   it is webhook-blocked by caller identity. Only the manager can, only via AddonRepository.
 
