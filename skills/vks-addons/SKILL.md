@@ -52,11 +52,11 @@ flowchart TB
     INPUT["ConfigMap / Cluster / another ClusterAddon<br/><i>resolved templateInputResource</i>"]
     CLUSTER["<b>Cluster</b><br/>carries the selector label"]
     CADDON(["<b>ClusterAddon</b><br/>one per matched cluster<br/>reports template + reconcile errors"])
-    SSEC["supervisorNamespaceOutput<br/>Secret, referenceType: ValuesRef"]
+    SSEC["supervisorNamespaceOutput<br/>Secret, referenceType: ValuesRef<br/><i>optional, usually unnecessary</i>"]
   end
 
   subgraph guest["Guest cluster"]
-    GSEC["targetClusterOutput<br/>Secret in the package namespace"]
+    GSEC["targetClusterOutput<br/>Secret in the package namespace<br/><i>this is what feeds the render</i>"]
     PI["<b>PackageInstall</b><br/>annot: addoninstall-name"]
     RENDER["Package render: ytt<br/>reads the data values"]
     HELM["HelmRelease<br/>helm-controller applies the chart"]
@@ -348,16 +348,47 @@ the Package's `addons.kubernetes.vmware.com/addon-config-definition` annotation 
 package-derived addon delivers its definition, and it is how you keep your own schema
 through the AddonRepository route. Encode with `gzip -c | base64 -w0`.
 
-**Per-cluster payload flows as data through a values Secret.** The standard pattern (see
-cilium):
+**Per-cluster payload flows as data through a values Secret.**
 
 1. Tenant writes values in `AddonConfig.spec.values`.
 2. The ACD's `templateOutputResources` render a **Secret** carrying those as data values.
-   Use a `supervisorNamespaceOutput` Secret with `referenceType: ValuesRef` (wired into the
-   guest PackageInstall's values) plus a `targetClusterOutput` Secret of the same name in
-   the guest package namespace (`vmware-system-tkg`). Body shape:
-   `stringData: {values.yaml: |\n  <data values>}` and `type: Opaque`.
+   One `targetClusterOutput` Secret in the guest package namespace (`vmware-system-tkg`) is
+   all it takes. Body shape: `stringData: {values.yaml: |\n  <data values>}` and
+   `type: Opaque`.
 3. The Package's own render (ytt, in the guest) reads those values and emits resources.
+
+**Do not copy cilium's two-output shape.** cilium pairs that `targetClusterOutput` with a
+`supervisorNamespaceOutput` carrying `referenceType: ValuesRef`, and it is the pattern
+everyone reaches for because cilium is the reference implementation. It is the rare shape
+and the Supervisor half is dead weight. Verified by decoding all 103 ACDs on a live
+Supervisor and cross-checking the guest:
+
+| output shape | ACDs (of 103) |
+|---|---|
+| `targetClusterOutput` only | 85 |
+| any `supervisorNamespaceOutput` | 18 |
+| …of those, carrying `referenceType: ValuesRef` | **3** |
+
+Most of that 18 are `ServiceAccountExport`, a genuinely Supervisor-side job and a good
+reason to use one. Only three ACDs use the Supervisor output to duplicate a values Secret.
+
+The guest `PackageInstall` resolves `secretRef` in **its own namespace**, so the
+target-cluster Secret is what feeds the render. Adding the Supervisor output produces a
+*second* entry in `spec.values` naming the same guest Secret, and nothing reads the
+Supervisor copy's contents. The symptom is visible from the guest — the addon with two
+entries is the one carrying a redundant output:
+
+```sh
+kubectl -n vmware-system-tkg get pkgi -o json | jq -r '.items[]
+  | "\(.metadata.name) values=\([.spec.values[]?.secretRef.name])"'
+# dayzero   values=["x-dayzero-data-values","x-dayzero-data-values"]   <- redundant
+# ako       values=["x-ako-data-values"]                               <- normal
+```
+
+The cost of copying it is a second output template body that must be kept byte-identical
+to the first by hand — in a Package that is frozen once published — plus the secrets-write
+grant discussed below. Use one `targetClusterOutput` unless something genuinely needs to
+read the payload on the Supervisor.
 
 To pass arbitrary YAML through ytt data values safely (ytt interprets `#@`): JSON-encode
 it in the ACD and decode in the package. E.g. structured resources as
@@ -365,12 +396,21 @@ it in the ACD and decode in the package. E.g. structured resources as
 `json.decode`. Raw multi-doc YAML as `{{ $raw | toJson }}`; the package splits on the doc
 separator and `yaml.decode`s each.
 
-**`addonInstallPermission` is Supervisor-side only.** `spec.addonInstallPermission.
-accessPolicies` on the ACD grants the addon controller rights *in the cluster's Supervisor
-namespace* — reading `templateInputResources` and writing the output Secret — and says
-nothing about the guest. Declare what your outputs and inputs actually touch; the shipped
-cilium ACD declares `get`/`list`/`watch` on configmaps plus full access to secrets, which
-is the usual shape.
+**`addonInstallPermission` is Supervisor-side only, and it does *not* gate input reads.**
+`spec.addonInstallPermission.accessPolicies` grants rights *in the cluster's Supervisor
+namespace* and says nothing about the guest. But it covers only what the addon **writes**
+there — the controller resolves `templateInputResources` with its own identity, so an
+input needs no matching rule.
+
+Verified: of the 26 shipped ACDs declaring a `Cluster` `templateInputResource`, **none**
+grants a `cluster.x-k8s.io` rule. cilium grants secrets only and still dereferences
+`.Dependencies.ClusterCR.spec.*` on a healthy cluster. So do not add read rules for your
+inputs — they are noise that reads as a requirement to the next person.
+
+What that leaves: if every output is a `targetClusterOutput`, the addon writes nothing into
+the tenant namespace and needs no secrets rule at all. All 85 target-only ACDs grant none.
+cilium's `get`/`list`/`watch` on configmaps plus full access to secrets exists because of
+its `supervisorNamespaceOutput`; copy it only if you copied that too.
 
 In the guest, the payload is applied by the `PackageInstall` identity the addon system
 owns, which is privileged enough to install cluster addons. An addon author does not get
@@ -400,7 +440,41 @@ Context roots:
   `templateInputResource`'s own `name` and `selector` values are themselves templatable
   against previously resolved inputs; the controller topologically sorts them, and a
   circular or self-reference is rejected at admission.
-- `.Cluster` (e.g. `.Cluster.name`) and `.Addon`.
+- `.Cluster` and `.Addon`. **`.Cluster` carries only `name` and `namespace`** — across all
+  103 shipped ACDs there are 195 uses of `.Cluster.name`, 10 of `.Cluster.namespace`, and
+  zero of anything else. There is no `.Cluster.uid`. Anything more about the cluster comes
+  from declaring the CAPI `Cluster` as an input, which is what all 26 addons needing
+  cluster state do. The canonical block, copied near-verbatim by every one of them:
+
+  ```yaml
+  - inputName: ClusterCR
+    apiVersion: cluster.x-k8s.io/v1beta2   # served and storage; v1beta1 is served but not
+    kind: Cluster
+    name: '{{.Cluster.name}}'
+    scope: Namespace                       # no constraints -- required
+  ```
+
+**Guard optional inputs with `hasKey`, not a bare lookup.** As soon as an ACD has more
+than one input, `.Dependencies` is non-empty even when an optional input is absent, so
+`{{ if .Dependencies.foo }}` evaluates a missing key on a populated map and dies with
+`map has no entry for key "foo"`. Every shipped ACD mixing a required `Cluster` with
+optional inputs uses the same form (450 `hasKey` uses in total):
+
+```
+{{- if and .Dependencies (hasKey .Dependencies "myConfigMap") }}
+```
+
+The trap is that a single-input ACD works fine with the bare form — `.Dependencies` is
+empty, so the outer test short-circuits — and breaks only when a second input is added.
+That is a change you make long after the template was written, in a Package version you
+cannot re-render.
+
+**Check a function is really registered before relying on it.** An unknown function is a
+*parse* error, which fails every cluster rather than just the path that uses it. Grepping
+the decoded ACDs is the cheap way to confirm. Present in shipped definitions:
+`hasKey` (450), `default` (17), `contains` (11), `printf` (9), `fail` (1, in cilium).
+Absent from all of them, so unproven: `toString`, `replace`, `regexMatch`. Prefer a
+`text/template` builtin where one exists — `printf "%v"` instead of `toString`.
 
 The Package's own guest-side render is **ytt** (`json`, `yaml`, `data` modules useful).
 
@@ -673,6 +747,32 @@ You can learn a lot without a full build/upload cycle.
     | .metadata.name as $n | (.spec.templateInputResources // [])[]
     | select(.kind=="ClusterAddon") | "\($n): \(.inputName) -> \(.name) \(.constraints)"'
   ```
+- **Survey all the ACDs at once before copying any one addon's structure.** The live
+  ACDs are already decoded — `get acd`, no gunzip needed — so one dump answers "is this
+  shape normal or is it cilium being unusual", which is the question behind most of the
+  corrections in this skill:
+  ```sh
+  kubectl -n vmware-system-vks-public get acd -o json > /tmp/acds.json
+
+  # How do addons structure their outputs? (85 target-only vs 5 with a supervisor half)
+  jq -r '.items[] | [(.spec.templateOutputResources // [])[]
+    | if .supervisorNamespaceOutput then "SUP:\(.supervisorNamespaceOutput.kind)"
+      else "TGT:\(.targetClusterOutput.kind)" end] | join(" + ")' /tmp/acds.json \
+    | sort | uniq -c | sort -rn
+
+  # Does anyone actually grant RBAC for the inputs they declare?
+  jq -r '.items[] | select([(.spec.templateInputResources // [])[].kind]
+    | index("Cluster")) | "\(.metadata.name) \([(.spec.addonInstallPermission.accessPolicies
+    // [])[].rules[].apiGroups[]] | unique)"' /tmp/acds.json
+
+  # Which template functions are proven to exist in the controller's funcmap?
+  for f in fail hasKey contains replace toString regexMatch; do
+    printf '%s: %s\n' "$f" "$(grep -o "{{[^}]*\b$f\b" /tmp/acds.json | wc -l)"
+  done
+  ```
+  Counts of zero are not proof of absence, but a function used by a shipped addon is proof
+  of presence — and that asymmetry is worth a lot when a missing function is a parse error
+  that fails every cluster.
 - **Test the guest render** directly: create an inline-fetch kapp-controller `App`, or a
   `Package` + `PackageInstall` with inline content and a values Secret, in a scratch guest
   namespace. Confirms the ytt render and that inline fetch pulls no image. kapp-controller
@@ -696,6 +796,13 @@ You can learn a lot without a full build/upload cycle.
   AddonRepository CRs in a **Supervisor Service** (they land in the service namespace; the
   manager still reconciles them). Build it with `kctrl package release` — it is a package
   reference, not a repository. Otherwise just `kubectl apply` the two CRs.
+- Writing an ACD by copying a shipped one: **survey before you copy**. cilium is the
+  reference everyone reaches for and two of its habits are not the norm — a duplicated
+  values Secret on the Supervisor (3 ACDs of 103) and the RBAC that exists only to write
+  it. Dump all the ACDs and count the shapes first; the probe is in the section above.
+- Needing something about the cluster in a template: `.Cluster` has **only** `name` and
+  `namespace`. Everything else, the UID included, comes from declaring the CAPI `Cluster`
+  as a `templateInputResource` — which needs no `accessPolicies` rule.
 - Deciding what a release tag means: make it the **repository/catalog version**, and take
   package versions from a list in the build. One version driving both is the mistake that
   forces consumers to hand-register a repo+install pair per package bump.
@@ -737,3 +844,18 @@ as independent build inputs, frozen per-version Package YAML under `released/`,
 `package-offerings` generated from the version list with a `make check` that compares it
 against the assembled bundle, version-suffixed AddonRepository names, and both kctrl
 release flows. `docs/plan.md` has the build mechanics.
+
+Its 1.0.3 is where several corrections in this skill came from. It expands `${CLUSTER_NAME}`
+and `${CLUSTER_UID}` tokens in the payload, which forced a second `templateInputResource`
+and surfaced the `hasKey` trap; and it drops the `supervisorNamespaceOutput` it had
+inherited from cilium. Two techniques there are worth stealing for any frozen-package
+addon:
+
+- **Test the ACD's Go templates locally**, with sprig plus `toYaml` and
+  `missingkey=error`, then feed the rendered values through the package's real ytt. The
+  controller only reports template errors per cluster after install, so this is the only
+  fast feedback loop that exists.
+- **Mutation-test the guards before publishing.** Reintroduce the bug — move a
+  substitution before a concatenation, revert a `hasKey` to a bare lookup — and confirm a
+  test actually goes red. A test that cannot fail is worth nothing in a Package version you
+  can never re-render, and both of those bugs pass every naive test.
