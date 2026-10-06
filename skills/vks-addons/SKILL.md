@@ -244,9 +244,17 @@ constant name — that is the update the webhook rejects.
 
 **The guest fetch is unavoidable with imgpkg.** `spec.package` forces a guest
 PackageInstall, and the guest acquires the package through a repository that fetches a
-bundle. There is no package-free-and-fetch-free path through the addon system. Guest pulls
-route through an in-cluster proxy (`mgmt-image-proxy.kube-system.svc` / the depot) that the
-Supervisor feeds, not straight to an external registry.
+bundle. There is no package-free-and-fetch-free path through the addon system. Where the
+guest fetches from depends on the repository: the builtin VKS repositories resolve to the
+in-cluster depot (`depot.kube-system.svc`, a headless Service the guest also carries, backed
+by the regional Harbor), while a custom AddonRepository is fetched from whatever URL it
+names — verified, a guest pulled a custom bundle straight from `ghcr.io`. So an air-gapped
+guest needs its own route to a custom repository's registry; the depot does not cover it.
+
+`mgmt-image-proxy.kube-system.svc.cluster.local` is **not** part of this path. It is an
+nginx virtual host on the Supervisor control plane that relays read-only pulls to the
+management-network registry holding Supervisor Service images, and only Supervisor Service
+vSphere Pods use it. It has no upstream to the depot, and a guest carries no reference to it.
 
 **Supervisor Service packages get their namespace rewritten.** A Supervisor Service is
 deployed with kapp's namespace rewrite, so every namespaced resource it applies lands in
