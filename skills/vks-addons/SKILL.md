@@ -122,10 +122,20 @@ Admin- or tenant-creatable, the levers you actually pull:
   References the `Addon` by `spec.addonRef`. Created in the cluster's Supervisor namespace.
   `stopMatchingBehavior` decides whether the addon's resources are removed or left behind
   when a cluster stops matching the selector. With `crossNamespaceSelection: Allowed`, one
-  AddonInstall selects clusters in **every** namespace: VCF Operations' telegraf ships
-  exactly one, `vcfops-telegraf-addoninstall` in `vmware-system-vks-public`, selecting
-  `addons.kubernetes.vmware.com/automated-monitoring=enabled`. The cluster label then is
-  the only per-cluster switch, and no namespace needs its own AddonInstall.
+  AddonInstall selects clusters in **every** namespace. There is one for telegraf,
+  `vcfops-telegraf-addoninstall` in `vmware-system-vks-public`, selecting
+  `addons.kubernetes.vmware.com/automated-monitoring=enabled`. Its field manager is
+  `manager`, the same name the VKS addon manager writes AddonReleases with, so who creates
+  it is not known. It need not live in the public namespace: secret-store's
+  `vault-injector-global-installer` sits in its Supervisor Service namespace and serves
+  clusters in ten others. The cluster label then is the only per-cluster switch, and no
+  namespace needs its own AddonInstall.
+
+  A cross-namespace AddonInstall does **not** react to a cluster gaining the label.
+  Verified: two clusters labelled after the AddonInstall last reconciled had no
+  ClusterAddon after 5 minutes. Touching the AddonInstall (any annotation) made them at
+  once, and a namespaced AddonInstall in the cluster's own namespace made one at once. How
+  long the cross-namespace one takes on its own was not measured.
 - **AddonConfig**: per-cluster values, validated against the ACD schema. Must be named
   `<cluster-name>-<addon-name>` — that name is how the system pairs config to cluster — in
   the cluster's Supervisor namespace, with annotation
@@ -307,7 +317,58 @@ vSphere Pods use it. It has no upstream to the depot, and a guest carries no ref
 deployed with kapp's namespace rewrite, so every namespaced resource it applies lands in
 the service's own namespace (`svc-<name>-<id>`), not where the YAML says. Cluster-scoped
 resources are exempt. The manager does reconcile an AddonRepository/AddonRepositoryInstall
-created in a service namespace, so a thin Supervisor Service wrapping those two CRs works.
+created in a service namespace, so a thin Supervisor Service wrapping those two CRs works
+**for an `imgpkgBundle` repository. A `helmRepository` one only half works there.**
+
+Verified on VKS 3.7. From a service namespace, the manager still creates the Addon, the
+AddonRelease and the generated ACD, and an AddonInstall can select clusters. But a helm
+addon also needs its Flux `HelmRepository` in every guest (`vmware-system-helm`), and that
+never arrives. The guest's HelmRelease waits with:
+
+```
+HelmChart 'vmware-system-helm/vmware-system-helm-<cluster>-<addon>' is not ready:
+  failed to get source: HelmRepository.source.toolkit.fluxcd.io "<targetRepositoryName>" not found
+```
+
+Why. The manager writes one ConfigMap per helm AddonRepositoryInstall,
+`<install-name>-config`, labelled `addons.kubernetes.vmware.com/helm-repo=true`, in the
+install's namespace. The builtin `helm-repo` addon (AddonInstall `helm-repo`, ACD
+`helm-repo-1.0.0`) renders a `HelmRepository` into every cluster from those ConfigMaps. Its
+`templateInputResources` read them **only from `vmware-system-vks-public`**. For any other
+namespace, the manager builds a per-namespace copy: an Addon `helm-repo-<namespace>`, then
+its ACD, AddonRelease and AddonInstall. The ACD grants access to that namespace in
+`spec.addonInstallPermission`, and the ACD webhook rejects it for a third-party service
+namespace:
+
+```
+admission webhook "addonconfigdefinition.validating.vmware.com" denied the request:
+  AddonConfigDefinition "helm-repo-<namespace>-1.0.0" is invalid:
+  spec.addonInstallPermission[*]: target namespace '<namespace>' in access policies is not the
+  cluster namespace or one of the public namespaces (vmware-system-vks-public or kube-public)
+  or a supervisor service namespace
+```
+
+So the Addon `helm-repo-<namespace>` exists, and nothing after it does. The
+AddonRepositoryInstall reports `Ready=False` with `PropagationMetadataResourcesReconciled=False`,
+`failed to create/update propagation metadata ACD`. The namespace *is* a Supervisor Service
+namespace (`managedBy: vSphere-AppPlatform`, `appplatform.vmware.com/serviceId`), so the
+webhook's test for one is something else; what, is not visible. A helm AddonRepository
+therefore belongs in `vmware-system-vks-public`. A Supervisor Service cannot put it there:
+the namespace rewrite above moves it out.
+
+kapp and the manager also fight over a helm AddonRepositoryInstall that kapp deploys. The
+manager adds the label `addons.kubernetes.vmware.com/helm: "true"` and the annotations
+`addons.kubernetes.vmware.com/addon-repository-version` and `.../target-repository-name`.
+kapp's next sync removes them, and the AddonRepositoryInstall webhook refuses, so the
+service's PackageInstall goes to `Reconcile failed`:
+
+```
+only addon manager service account is allowed to modify VKS-managed labels/annotations
+(kubernetes.vmware.com/managed-by, addons.kubernetes.vmware.com/pkgr-type,
+addons.kubernetes.vmware.com/addon-repository-version)
+```
+
+A kapp `rebaseRule` that keeps those keys from the live object should fix it (not tested).
 
 **Placement and required labels/annotations.**
 - The three addon kinds must be in `vmware-system-vks-public`.
@@ -762,6 +823,16 @@ only the repository around them.
 
 You can learn a lot without a full build/upload cycle.
 
+- **Read the manager's own errors.** The VKS addon manager, controllers and webhooks
+  alike, is `tanzu-addons-controller-manager` in the VKS service namespace
+  (`svc-tkg-<id>`). A vSphere administrator's Supervisor login can read its log. A
+  condition such as `failed to create/update propagation metadata ACD` carries no reason;
+  the log has the webhook's full refusal.
+  ```sh
+  kubectl -n "$(kubectl get ns -o name | grep -o 'svc-tkg-[a-z0-9]*')" \
+    logs deploy/tanzu-addons-controller-manager --since=1h | grep -i '<object name>'
+  ```
+
 - **Test the webhook lock** without publishing anything: mint a token for a service account
   that has RBAC on the kind, and attempt the create.
   ```sh
@@ -870,7 +941,9 @@ You can learn a lot without a full build/upload cycle.
   annotation — it is required of every AddonRepository, whatever the fetch.
 - Want single-upload delivery through the vCenter Services catalog: wrap the two
   AddonRepository CRs in a **Supervisor Service** (they land in the service namespace; the
-  manager still reconciles them). Build it with `kctrl package release` — it is a package
+  manager still reconciles them). **imgpkg repositories only**: a helm repository in a
+  service namespace never gets its `HelmRepository` into the guests (see the namespace
+  rewrite above). Register a helm repository in `vmware-system-vks-public` instead. Build it with `kctrl package release` — it is a package
   reference, not a repository. Otherwise just `kubectl apply` the two CRs.
 - Writing an ACD by copying a shipped one: **survey before you copy**. cilium is the
   reference everyone reaches for and two of its habits are not the norm — a duplicated
