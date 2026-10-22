@@ -105,7 +105,7 @@ Manager-owned, created for you, live in `vmware-system-vks-public`:
 - **AddonConfigDefinition (ACD)**: the addon's contract. `openAPIV3Schema` is the
   tenant-facing values schema; `templateOutputResources` is what it renders per cluster;
   optional `templateInputResources` declares Supervisor objects to read (a `ConfigMap`,
-  the `Cluster`, another addon's `ClusterAddon`); `spec.addonInstallPermission.accessPolicies`
+  a `Secret`, the `Cluster`, another addon's `ClusterAddon`); `spec.addonInstallPermission.accessPolicies`
   grants the rights for those reads and writes.
 - **Addon**: groups releases of one addon. Mostly metadata (`displayName`, `description`).
 - **AddonRelease**: binds an `Addon` to an `AddonConfigDefinition` version, carries
@@ -121,18 +121,49 @@ Admin- or tenant-creatable, the levers you actually pull:
 - **AddonInstall**: a tenant attaches an addon to clusters via a label selector.
   References the `Addon` by `spec.addonRef`. Created in the cluster's Supervisor namespace.
   `stopMatchingBehavior` decides whether the addon's resources are removed or left behind
-  when a cluster stops matching the selector.
+  when a cluster stops matching the selector. With `crossNamespaceSelection: Allowed`, one
+  AddonInstall selects clusters in **every** namespace: VCF Operations' telegraf ships
+  exactly one, `vcfops-telegraf-addoninstall` in `vmware-system-vks-public`, selecting
+  `addons.kubernetes.vmware.com/automated-monitoring=enabled`. The cluster label then is
+  the only per-cluster switch, and no namespace needs its own AddonInstall.
 - **AddonConfig**: per-cluster values, validated against the ACD schema. Must be named
   `<cluster-name>-<addon-name>` — that name is how the system pairs config to cluster — in
   the cluster's Supervisor namespace, with annotation
   `clusteraddon.addons.kubernetes.vmware.com/owned-for-deletion: "true"` so it is garbage
-  collected with the ClusterAddon.
+  collected with the ClusterAddon. `spec` has exactly three fields —
+  `addonConfigDefinitionRef`, `clusterName`, `values` — so there is **no** `secretRef` or
+  `valuesFrom`: an AddonConfig cannot point at a Secret. A Secret reaches the render only
+  if the ACD declares it as a `templateInputResource`. Do not set `spec.clusterName`
+  yourself; the addon system sets it and warns when a client does. An AddonConfig need not
+  be tenant-written: telegraf's (`<cluster>-telegraf`) is created by a Supervisor-side
+  controller, owned by the ClusterAddon, with values (the Metrics Aggregator's
+  LoadBalancer IP) that differ from the ACD defaults.
 
 Created for you per matched cluster, and the thing to actually debug:
 
 - **ClusterAddon**: one per cluster the `AddonInstall` selector matched. This is where the
   ACD's output templates evaluate, against that cluster's `AddonConfig`, so template errors
   surface in *its* conditions, per cluster, rather than anywhere upstream.
+
+**Two writers can share one AddonConfig with server-side apply.** `spec.values` is
+`x-kubernetes-preserve-unknown-fields`, and SSA tracks ownership per nested map key inside
+it. Verified with two field managers on one AddonConfig: `argocd-controller` applied
+`helmValues.aggregator.replicaCount`, a controller applied `helmValues.vcfOps.*`, Argo
+re-applied its manifest without `vcfOps` and the controller's keys stayed, and Argo then
+setting `vcfOps.clientId` was refused:
+
+```
+error: Apply failed with 1 conflict: conflict with "platform-observability-service": .spec.values.helmValues.vcfOps.clientId
+```
+
+Rules: split by key, never inside a list (a list is one atomic field); each writer applies
+with its own `--field-manager`; the controller applies with `force` so it always reclaims
+its own keys. Argo CD's server-side sync forces conflicts, so a controller-owned key that
+appears in Git is taken over silently — keep those keys out of Git, and give the
+Application `ServerSideApply=true` and `ServerSideDiff=true` so the controller's keys do not
+show as drift. The addon manager also updates AddonConfigs (field manager `manager`) but
+owns nothing under `spec.values`. Whoever creates the object decides what a delete takes
+with it: if Argo CD prunes the AddonConfig, the controller's keys go too.
 
 ## The hard constraints (the expensive lessons)
 
@@ -180,6 +211,22 @@ AddonRelease, the design is back on the table.
   (helm only) narrows which charts and versions off the upstream index get reconciled —
   `[{name: external-secrets, versions: ["2.8.0"]}]` against `https://charts.external-secrets.io`.
   It selects; it does not exempt the repository from the `package-offerings` annotation.
+
+The generated helm ACD, verified on a live one (`<addon>.<version>`): schema is
+`helmOptions` (only `targetNamespace`, default `default`) and `helmValues`
+(`x-kubernetes-preserve-unknown-fields`); **no `templateInputResources`**; two outputs:
+
+| output | name | what the template does |
+|---|---|---|
+| `targetClusterOutput` Secret, `referenceType: ValuesRef`, ns `vmware-system-helm` | `{{.Cluster.name}}-{{.Addon.name}}-values` | `stringData.values.yaml` = `.Values.helmValues \| toYaml`, nothing else |
+| `supervisorNamespaceOutput` ConfigMap, `referenceType: Direct` | `{{.Cluster.name}}-{{.Addon.name}}-options` | `data` = `.Values.helmOptions` |
+
+So with a helm repository the AddonConfig's `helmValues` is the **only** way per-cluster
+data reaches the chart, secrets included, and it lands there in plain text. The guest
+HelmRelease reads the values Secret through `valuesFrom` with `interval: 10m` and does
+not watch it: an AddonConfig change reaches the guest Secret within seconds, but the
+release is upgraded only on the next interval (measured: about 9 minutes). Plan for that
+lag when a value is a credential that the old value stops working the moment it changes.
 
 | | `imgpkgBundle` | `helmRepository` |
 |---|---|---|
@@ -477,12 +524,33 @@ empty, so the outer test short-circuits — and breaks only when a second input 
 That is a change you make long after the template was written, in a Package version you
 cannot re-render.
 
+**A Secret input is how a credential reaches the render without sitting in an
+AddonConfig.** On one VKS 3.7 Supervisor, 10 of 59 ACDs declare a `Secret`
+`templateInputResource` in the cluster's namespace: AKO (`{{.Cluster.name}}-avi-secret`),
+antrea, vault-injector, telegraf (`telegraf-{{.Cluster.name}}`, an mTLS client
+certificate that cert-manager issues per cluster) and the helm-repo addon. The object
+arrives as-is, so `.data` values are still base64; every one decodes in the template:
+
+```
+{{- if and .Dependencies (hasKey .Dependencies "akoConfig") .Dependencies.akoConfig (hasKey .Dependencies.akoConfig.data "clusterName") }}
+clusterName: "{{ .Dependencies.akoConfig.data.clusterName | decodebase64 }}"
+```
+
+The pattern behind it, as telegraf ships it: a Supervisor-side controller writes per-cluster
+Secrets into the cluster's namespace, and the ACD reads them as inputs. Whoever can read
+Secrets there can read the credential, which is usually a narrower set than whoever can
+read AddonConfigs.
+
 **Check a function is really registered before relying on it.** An unknown function is a
 *parse* error, which fails every cluster rather than just the path that uses it. Grepping
 the decoded ACDs is the cheap way to confirm. Present in shipped definitions:
 `hasKey` (450), `default` (17), `contains` (11), `printf` (9), `fail` (1, in cilium).
 Absent from all of them, so unproven: `toString`, `replace`, `regexMatch`. Prefer a
 `text/template` builtin where one exists — `printf "%v"` instead of `toString`.
+A second Supervisor (59 ACDs) adds: `toYaml` (97), `decodebase64` (27), `dict` (9),
+`set` (7), `deepCopy` (5), `fromYaml` (5). Absent there: `b64dec` (sprig's name — use
+`decodebase64`), `merge`, `mergeOverwrite`. To add keys to a values map, build it with
+`deepCopy`, `set` and `dict` rather than `merge`.
 
 The Package's own guest-side render is **ytt** (`json`, `yaml`, `data` modules useful).
 
