@@ -306,9 +306,8 @@ Re-test with the token probe below — if a non-manager service account can crea
 AddonRelease, the design is back on the table.
 
 A change letting privileged users (the SSO administrators) create Addons, AddonReleases,
-ACDs and AddonInstalls directly in `vmware-system-vks-public` was described to us as
-coming, but is not in the VKS 3.8 release notes, and on VKS 3.8 with Supervisor
-`vsc9.1.1.0` it is not there: the administrator has no RBAC for it, and the webhooks
+ACDs and AddonInstalls directly in `vmware-system-vks-public` is planned, but confirmed
+**not** part of VKS 3.8. On 3.8 the administrator has no RBAC for it, and the webhooks
 refuse a Supervisor Service. Even once it lands, a Supervisor Service cannot use it
 directly, because kapp moves everything out of `vmware-system-vks-public`; it would take a
 runtime controller, or an administrator applying the objects.
@@ -1149,7 +1148,8 @@ You can learn a lot without a full build/upload cycle.
 - Tempted to create the Addon/AddonRelease/ACD yourself (Job, controller, apply,
   Supervisor Service): **do not**, on VKS 3.8 with Supervisor 9.1.1.0 all three are
   webhook-blocked, and the Supervisor administrator has no RBAC for them. Only the
-  manager can, only via AddonRepository. Re-test on a newer Supervisor (see the probes).
+  manager can, only via AddonRepository. Direct creation by privileged users is planned for
+  a release after 3.8; re-test then (see the probes).
 
 ## Reference implementation
 
