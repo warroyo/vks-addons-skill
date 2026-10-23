@@ -11,15 +11,17 @@ description: >-
   reconcile. Covers the manager-only webhooks, the immutability of an installed
   AddonRepository, the package-offerings annotation, the payload-as-data pattern, the
   template dialect, cross-addon dependencies (dependsOn and ClusterAddon template
-  inputs), and live verification probes.
+  inputs), what changed in VKS 3.8 (helm charts with their own ACD, OCI helm sources,
+  helm repositories from Supervisor Service namespaces), and live verification probes.
 metadata:
-  source: empirical, verified against VKS 3.7 (Supervisor + guest)
+  source: empirical, verified against VKS 3.7 and 3.8 (Supervisor + guest)
 ---
 
 # Working with VKS addons
 
 Hard-won, verified knowledge of the VKS addon system. Facts here were checked against a
-live Supervisor and guest cluster (VKS 3.7). Where something is inferred rather than
+live Supervisor and guest cluster (VKS 3.7, and VKS 3.8.0 on Supervisor 9.1.1.0 where a
+fact changed; see *What changed in VKS 3.8*). Where something is inferred rather than
 tested, it says so. Trust shipped definitions over CRD field descriptions, which are
 sometimes stale.
 
@@ -117,15 +119,27 @@ Admin- or tenant-creatable, the levers you actually pull:
 
 - **AddonRepository** + **AddonRepositoryInstall**: an admin creates these; the manager
   reconciles them and materialises the three kinds above. This is the only way to get
-  them created (see constraints).
+  them created (see constraints). Still true on VKS 3.8 with Supervisor 9.1.1.0: the
+  Supervisor administrator's RBAC allows `create` on these two kinds in every namespace,
+  and on no Addon, AddonRelease or ACD anywhere.
 - **AddonInstall**: a tenant attaches an addon to clusters via a label selector.
   References the `Addon` by `spec.addonRef`. Created in the cluster's Supervisor namespace.
   `stopMatchingBehavior` decides whether the addon's resources are removed or left behind
   when a cluster stops matching the selector. With `crossNamespaceSelection: Allowed`, one
-  AddonInstall selects clusters in **every** namespace: VCF Operations' telegraf ships
-  exactly one, `vcfops-telegraf-addoninstall` in `vmware-system-vks-public`, selecting
-  `addons.kubernetes.vmware.com/automated-monitoring=enabled`. The cluster label then is
-  the only per-cluster switch, and no namespace needs its own AddonInstall.
+  AddonInstall selects clusters in **every** namespace. There is one for telegraf,
+  `vcfops-telegraf-addoninstall` in `vmware-system-vks-public`, selecting
+  `addons.kubernetes.vmware.com/automated-monitoring=enabled`. Its field manager is
+  `manager`, the same name the VKS addon manager writes AddonReleases with, so who creates
+  it is not known. It need not live in the public namespace: secret-store's
+  `vault-injector-global-installer` sits in its Supervisor Service namespace and serves
+  clusters in ten others. The cluster label then is the only per-cluster switch, and no
+  namespace needs its own AddonInstall.
+
+  A cross-namespace AddonInstall does **not** react to a cluster gaining the label.
+  Verified: two clusters labelled after the AddonInstall last reconciled had no
+  ClusterAddon after 5 minutes. Touching the AddonInstall (any annotation) made them at
+  once, and a namespaced AddonInstall in the cluster's own namespace made one at once. How
+  long the cross-namespace one takes on its own was not measured.
 - **AddonConfig**: per-cluster values, validated against the ACD schema. Must be named
   `<cluster-name>-<addon-name>` — that name is how the system pairs config to cluster — in
   the cluster's Supervisor namespace, with annotation
@@ -165,6 +179,82 @@ show as drift. The addon manager also updates AddonConfigs (field manager `manag
 owns nothing under `spec.values`. Whoever creates the object decides what a delete takes
 with it: if Argo CD prunes the AddonConfig, the controller's keys go too.
 
+## What changed in VKS 3.8
+
+VKS 3.8.0+v1.37 (October 2026). Each item says whether it was checked on a live Supervisor
+(VKS 3.8.0, Supervisor `v1.34.9+vmware.1-vsc9.1.1.0`) or comes from the release notes only.
+The sections below are updated where 3.8 changes them.
+
+Verified live:
+
+- **Helm AddonRepositories propagate from any namespace, Supervisor Service namespaces
+  included.** The 3.7 failure (*Supervisor Service packages get their namespace rewritten*,
+  below) is gone. The manager now copies the repository ConfigMap into
+  `vmware-system-vks-public` as `<install-name>-config-<namespace prefix>-<hash>`, and the
+  single builtin `helm-repo` addon (ACD `helm-repo-1.0.1`, which still reads only
+  `vmware-system-vks-public`) renders the guest `HelmRepository` from it. No per-namespace
+  `helm-repo-<namespace>` addon is built any more; one left over from 3.7 stays as an
+  orphan Addon with no release. An install that failed under 3.7 turned
+  `PropagationMetadataResourcesReconciled=True` on its own after the upgrade, and the guests
+  got the `HelmRepository` and installed the chart. The release notes do not mention this.
+- **A helm chart can carry its own ACD.** Same annotation and encoding as a Carvel Package:
+  `addons.kubernetes.vmware.com/addon-config-definition` in `Chart.yaml`, gzip+base64 ACD
+  YAML. The builtin 3.8 `tekton-operator` and `external-secrets` charts both do this. See
+  *Helm charts with their own ACD*, below.
+- **Chart metadata feeds the addon CRs.** `Chart.yaml` `kubeVersion` becomes
+  `AddonRelease.spec.kubernetesVersionConstraints` (`>= 1.19.0-0` on external-secrets). A
+  third-party chart's `description` became its `Addon.spec.description`; the builtin helm
+  Addons carry only their name there, so the rule is not clear. Every helm AddonRelease gets
+  `spec.chart` (`name`, `version`, plus `digest` for an OCI chart) and
+  `dependsOn: [{addonRef: {name: helm-controller}}]` without the chart asking for it. The
+  release notes add `icon` and `dependencies` (dependencies between add-ons); not checked.
+- **OCI helm sources.** `spec.fetch.helmRepository.url` accepts `oci://`. The builtin helm
+  repositories are `oci://projects.packages.broadcom.com/vsphere/supervisor/vks-standard-packages/<version>/vks-addons-helm`
+  and the depot mirror `oci://depot.kube-system.svc/vcf/vks-standard-packages/ga/<version>/vks-addons-helm`.
+  Their AddonReleases pin `spec.chart.digest`. A server dry run of an `oci://` repository is
+  admitted. The guest `HelmRepository` gets `spec.type` from the repository ConfigMap.
+- **`package-offerings` is optional on a helm AddonRepository and still required on an imgpkg
+  one.** Server dry runs without the annotation: both `helmRepository` forms are admitted,
+  and `imgpkgBundle` is still rejected with `metadata.annotations.addons.kubernetes.vmware.com/package-offerings: Not found`.
+  The builtin 3.8 helm repositories carry none.
+- **VKS ships its own helm addons.** `builtin-helm-addonrepository-3.8.0` (plus its depot
+  mirror) registers `external-secrets` and `tekton-operator` as helm addons, with
+  hand-written ACDs, alongside the Carvel `builtin-addonrepository-3.8.0`.
+- **AddonConfigDefinition is locked now too.** See the hard constraints below.
+- **Two new Supervisor-side kinds.** `ConfigExport` publishes (part of) a Supervisor object
+  as a ConfigMap in `vmware-system-vks-public` (`spec.source`, `spec.extract`, `spec.toName`,
+  `spec.serviceAccountName`; the source is any kind, such as `ConfigMap`, `Service` or
+  `SupervisorProperties`); VKS ships three, such as `supervisor-apiserver-endpoints` in
+  `kube-system`. `CertificateExport` copies a Supervisor cert-manager `Certificate` (or a CA
+  bundle from a ConfigMap) into a guest cluster as a Secret, and keeps it in sync through
+  renewals (`spec.clusterName`, `spec.source`, `spec.target`, `spec.serviceAccountName`).
+  The Supervisor administrator can only read both kinds. CertificateExport does not copy an
+  arbitrary Secret; whether ConfigExport takes a Secret source is not tested, and its
+  output is a ConfigMap in a public namespace either way.
+
+From the release notes only, not tested here:
+
+- The same chart name can be registered in several AddonRepositories.
+- Private helm registries: credentials are optional, and without them the registry is
+  treated as anonymous. Known issue: such an AddonRepositoryInstall fails authentication
+  until at least one VKS cluster exists on the Supervisor. The repository ConfigMap names
+  `<repository>-auth` and `<repository>-cert` Secrets, so those are probably the names it
+  reads (inferred).
+- `addonrepository.addons.kubernetes.vmware.com/global-image-registry`, an annotation that
+  injects a registry URL into the addon's images.
+- CRDs in a helm chart are installed and updated on addon upgrades.
+- `helmOptions.install.createNamespace` can be turned off in an AddonConfig.
+- ACD templates may use Go template expressions in output labels and annotations.
+- For Kubernetes releases 1.37 and later, the core addons are managed by this addon
+  framework instead of ClusterBootstrap, legacy addon resources are ignored, and
+  ClusterBootstrap creation is blocked. The `vcf package` CLI plugin is deprecated in favour
+  of `vcf addon`.
+- Known issue: after an upgrade, an AddonRepositoryInstall may report Non-Ready, caused by
+  cascading helm chart metadata fields to Addon objects. The workaround is Broadcom
+  Support.
+- Known issue: add-on manager memory grows with clusters times helm addons. The documented
+  caps are 600 helm-based addons in total at up to 300 clusters, and 100 at up to 500.
+
 ## The hard constraints (the expensive lessons)
 
 **Addon and AddonRelease are manager-locked.** Validating webhooks
@@ -180,11 +270,26 @@ Addon is a managed resource and CREATE is not allowed
 operation on an AddonRelease is only allowed from VKS addon manager service account
 ```
 
-**AddonConfigDefinition is NOT locked, but it is inert alone.** You can create an ACD
-directly, but nothing consumes one that is not selected by an AddonRelease, and an
-AddonInstall requires the Addon to reconcile ("The Addon must be created to reconcile the
-AddonInstall"), with no field pointing at an ACD. So authoring only the ACD gets you
-nothing.
+On VKS 3.8 the Addon webhook also pins the namespace. A create from a Supervisor Service
+(kapp, so in the service namespace) was refused on that before any identity check showed:
+
+```
+admission webhook "addon.validating.vmware.com" denied the request:
+  Addon.addons.kubernetes.vmware.com "<name>" is invalid: metadata.namespace:
+  Unsupported value: "svc-<name>-<id>": supported values: "vmware-system-vks-public"
+```
+
+**AddonConfigDefinition is locked too, from VKS 3.8.** On 3.7 you could create an ACD
+directly, but it was inert alone: nothing consumes one that is not selected by an
+AddonRelease, and an AddonInstall requires the Addon to reconcile ("The Addon must be
+created to reconcile the AddonInstall"), with no field pointing at an ACD. On 3.8 the
+create itself is refused, verified from a Supervisor Service:
+
+```
+admission webhook "addonconfigdefinition.validating.vmware.com" denied the request:
+  addonconfigdefinitions.addons.kubernetes.vmware.com is forbidden:
+  operation on an AddonConfigDefinition is only allowed from VKS system service accounts
+```
 
 *This is what blocks the package-free, fetch-free design*, which is otherwise the better
 one and worth knowing about: a Supervisor Service lays down the ACD, the Addon, and an
@@ -200,19 +305,30 @@ AddonRelease; or AddonInstall gains a direct ACD reference, removing the need fo
 Re-test with the token probe below — if a non-manager service account can create an
 AddonRelease, the design is back on the table.
 
+A change letting privileged users (the SSO administrators) create Addons, AddonReleases,
+ACDs and AddonInstalls directly in `vmware-system-vks-public` is planned, but confirmed
+**not** part of VKS 3.8. On 3.8 the administrator has no RBAC for it, and the webhooks
+refuse a Supervisor Service. Even once it lands, a Supervisor Service cannot use it
+directly, because kapp moves everything out of `vmware-system-vks-public`; it would take a
+runtime controller, or an administrator applying the objects.
+
 **The only route to create the three kinds is an AddonRepository.** Two flavours:
 
 - `fetch.imgpkgBundle`: a Carvel package repository. The manager reads the Package(s) and
   creates the addon CRs. The AddonRelease gets `spec.package` set, so the guest gets a
   PackageInstall. This preserves a hand-written ACD (it travels in a Package annotation).
-- `fetch.helmRepository`: the manager generates the ACD from the chart, with a fixed
-  `helmValues`/`helmOptions` schema, and the AddonRelease is package-free. You lose control
-  of the ACD schema and pull in `helm-controller` as a dependency. `spec.addonFilters`
-  (helm only) narrows which charts and versions off the upstream index get reconciled —
+- `fetch.helmRepository`: the AddonRelease is package-free, and `helm-controller` becomes
+  a dependency. The ACD comes from the chart's `addon-config-definition` annotation when it
+  has one (VKS 3.8, see *Helm charts with their own ACD*), and is otherwise generated with
+  a fixed `helmValues`/`helmOptions` schema. The URL is an `https://` chart index or, from
+  3.8, an `oci://` registry. `spec.addonFilters` (helm only) narrows which charts and
+  versions off the upstream index get reconciled —
   `[{name: external-secrets, versions: ["2.8.0"]}]` against `https://charts.external-secrets.io`.
-  It selects; it does not exempt the repository from the `package-offerings` annotation.
+  On 3.7 it does not exempt the repository from the `package-offerings` annotation; on 3.8
+  a helm repository needs no annotation at all.
 
-The generated helm ACD, verified on a live one (`<addon>.<version>`): schema is
+The generated helm ACD, for a chart without its own, verified on a live one
+(`<addon>.<version>`, the same on 3.7 and 3.8): schema is
 `helmOptions` (only `targetNamespace`, default `default`) and `helmValues`
 (`x-kubernetes-preserve-unknown-fields`); **no `templateInputResources`**; two outputs:
 
@@ -230,12 +346,14 @@ lag when a value is a credential that the old value stops working the moment it 
 
 | | `imgpkgBundle` | `helmRepository` |
 |---|---|---|
-| ACD | yours, shipped in the `Package` annotation as gzip+base64 | generated from the chart, fixed `helmValues`/`helmOptions` schema |
-| Tenant API | whatever schema you write | helm values |
+| ACD | yours, shipped in the `Package` annotation as gzip+base64 | generated, fixed `helmValues`/`helmOptions` schema; from 3.8 yours, in the `Chart.yaml` annotation |
+| Tenant API | whatever schema you write | helm values (3.8: your schema over them) |
 | Guest mechanism | `PackageInstall` -> ytt -> kapp | `HelmRelease` via helm-controller |
 | `AddonRelease.spec.package` | set | not set |
 | Dependencies | kapp-controller only | helm-controller must be installed |
 | Version selection | the versions in the bundle | `spec.addonFilters` |
+| Source | imgpkg bundle in an OCI registry | chart index over `https://`; from 3.8 also `oci://` |
+| `package-offerings` | required | required on 3.7, optional on 3.8 |
 
 **An AddonRepository is frozen once an AddonRepositoryInstall references it.**
 `addonrepositories.validating.vmware.com` permits only `spec.addonFilters` to be modified
@@ -308,6 +426,60 @@ deployed with kapp's namespace rewrite, so every namespaced resource it applies 
 the service's own namespace (`svc-<name>-<id>`), not where the YAML says. Cluster-scoped
 resources are exempt. The manager does reconcile an AddonRepository/AddonRepositoryInstall
 created in a service namespace, so a thin Supervisor Service wrapping those two CRs works.
+On VKS 3.8 that holds for both fetch flavours. **On VKS 3.7 a `helmRepository` one only
+half works there**, as follows.
+
+Verified on VKS 3.7, fixed in 3.8 (see *What changed in VKS 3.8*). From a service namespace, the manager still creates the Addon, the
+AddonRelease and the generated ACD, and an AddonInstall can select clusters. But a helm
+addon also needs its Flux `HelmRepository` in every guest (`vmware-system-helm`), and that
+never arrives. The guest's HelmRelease waits with:
+
+```
+HelmChart 'vmware-system-helm/vmware-system-helm-<cluster>-<addon>' is not ready:
+  failed to get source: HelmRepository.source.toolkit.fluxcd.io "<targetRepositoryName>" not found
+```
+
+Why. The manager writes one ConfigMap per helm AddonRepositoryInstall,
+`<install-name>-config`, labelled `addons.kubernetes.vmware.com/helm-repo=true`, in the
+install's namespace. The builtin `helm-repo` addon (AddonInstall `helm-repo`, ACD
+`helm-repo-1.0.0`) renders a `HelmRepository` into every cluster from those ConfigMaps. Its
+`templateInputResources` read them **only from `vmware-system-vks-public`**. For any other
+namespace, the manager builds a per-namespace copy: an Addon `helm-repo-<namespace>`, then
+its ACD, AddonRelease and AddonInstall. The ACD grants access to that namespace in
+`spec.addonInstallPermission`, and the ACD webhook rejects it for a third-party service
+namespace:
+
+```
+admission webhook "addonconfigdefinition.validating.vmware.com" denied the request:
+  AddonConfigDefinition "helm-repo-<namespace>-1.0.0" is invalid:
+  spec.addonInstallPermission[*]: target namespace '<namespace>' in access policies is not the
+  cluster namespace or one of the public namespaces (vmware-system-vks-public or kube-public)
+  or a supervisor service namespace
+```
+
+So the Addon `helm-repo-<namespace>` exists, and nothing after it does. The
+AddonRepositoryInstall reports `Ready=False` with `PropagationMetadataResourcesReconciled=False`,
+`failed to create/update propagation metadata ACD`. The namespace *is* a Supervisor Service
+namespace (`managedBy: vSphere-AppPlatform`, `appplatform.vmware.com/serviceId`), so the
+webhook's test for one is something else; what, is not visible. On 3.7 a helm
+AddonRepository therefore belongs in `vmware-system-vks-public`, and a Supervisor Service
+cannot put it there: the namespace rewrite above moves it out. On 3.8 the manager copies
+the ConfigMap into `vmware-system-vks-public` instead, and the same install works.
+
+kapp and the manager also fight over a helm AddonRepositoryInstall that kapp deploys. The
+manager adds the label `addons.kubernetes.vmware.com/helm: "true"` and the annotations
+`addons.kubernetes.vmware.com/addon-repository-version` and `.../target-repository-name`.
+kapp's next sync removes them, and the AddonRepositoryInstall webhook refuses, so the
+service's PackageInstall goes to `Reconcile failed`:
+
+```
+only addon manager service account is allowed to modify VKS-managed labels/annotations
+(kubernetes.vmware.com/managed-by, addons.kubernetes.vmware.com/pkgr-type,
+addons.kubernetes.vmware.com/addon-repository-version)
+```
+
+Still the case on VKS 3.8, with the same refusal. A kapp `rebaseRule` that keeps those keys
+from the live object should fix it (not tested).
 
 **Placement and required labels/annotations.**
 - The three addon kinds must be in `vmware-system-vks-public`.
@@ -335,7 +507,10 @@ created in a service namespace, so a thin Supervisor Service wrapping those two 
   The AddonRepository "<name>" is invalid:
     metadata.annotations.addons.kubernetes.vmware.com/package-offerings: Not found
   ```
-  On a helm repository `addonFilters` does **not** stand in for it; live helm-based repos
+  That is VKS 3.7. On VKS 3.8 a `helmRepository` AddonRepository without the annotation is
+  admitted (server dry run, both `https://` and `oci://`), and the builtin 3.8 helm
+  repositories carry none; an `imgpkgBundle` one is still rejected as above.
+  On 3.7, on a helm repository `addonFilters` does **not** stand in for it; live helm-based repos
   carry both, with the annotation restating the filter
   (`{"repositoryVersion":"1.0.0","packages":{"external-secrets":{"versions":["2.8.0"]}}}`
   next to `addonFilters: [{name: external-secrets, versions: ["2.8.0"]}]`). For a helm
@@ -402,6 +577,40 @@ the Package's `addons.kubernetes.vmware.com/addon-config-definition` annotation 
 **gzip+base64**. The manager decodes it and creates the ACD. This is how cilium and every
 package-derived addon delivers its definition, and it is how you keep your own schema
 through the AddonRepository route. Encode with `gzip -c | base64 -w0`.
+
+### Helm charts with their own ACD (VKS 3.8)
+
+A helm chart carries its ACD the same way: annotation
+`addons.kubernetes.vmware.com/addon-config-definition` in `Chart.yaml`, gzip+base64 ACD
+YAML. Verified by pulling the builtin 3.8 charts and decoding them:
+
+```sh
+helm pull oci://projects.packages.broadcom.com/vsphere/supervisor/vks-standard-packages/3.8.0-20261021/vks-addons-helm/tekton-operator \
+  --version 0.80.0+vmware.1-vks.1
+tar -xzf tekton-operator-*.tgz
+yq -r '.annotations["addons.kubernetes.vmware.com/addon-config-definition"]' tekton-operator/Chart.yaml \
+  | base64 -d | gunzip
+```
+
+What the shipped ones (`tekton-operator`, `external-secrets`) contain:
+
+- The `metadata.name` in the annotation is not used as is: the chart's says
+  `tekton-operator.0.80.0---vmware.1-vks.1`, and the live ACD is
+  `tekton-operator.0.80.0-vmware.1-vks.1`, the same `<chart>.<version>` (`+` to `-`) name as
+  a generated one.
+- The same two outputs as the generated ACD: the `helmValues` Secret in
+  `vmware-system-helm` (`ValuesRef`) and the `helmOptions` ConfigMap on the Supervisor
+  (`Direct`). So the guest mechanism is unchanged; what the chart gains is the schema.
+- A real `openAPIV3Schema`: `helmValues` keeps `x-kubernetes-preserve-unknown-fields` but
+  lists the chart's values with types, descriptions and defaults, and `helmOptions.targetNamespace`
+  gets a chart-specific default (`tekton-operator`, not `default`).
+- `addonInstallPermission` with a configmaps rule (`get`, `create`, `update`, `patch`, and
+  `delete` on tekton) in the cluster namespace, for the `helmOptions` ConfigMap.
+- No `templateInputResources`. Whether a chart's own ACD may declare inputs (a Secret, the
+  `Cluster`, another `ClusterAddon`) and add outputs is not tested; nothing in the format
+  forbids it, since it is a full ACD.
+
+A chart without the annotation still gets the generated ACD (verified on 3.8).
 
 **Per-cluster payload flows as data through a values Secret.**
 
@@ -762,13 +971,38 @@ only the repository around them.
 
 You can learn a lot without a full build/upload cycle.
 
+- **Read the manager's own errors.** The VKS addon manager, controllers and webhooks
+  alike, is `tanzu-addons-controller-manager` in the VKS service namespace
+  (`svc-tkg-<id>`). A vSphere administrator's Supervisor login can read its log. A
+  condition such as `failed to create/update propagation metadata ACD` carries no reason;
+  the log has the webhook's full refusal.
+  ```sh
+  kubectl -n "$(kubectl get ns -o name | grep -o 'svc-tkg-[a-z0-9]*')" \
+    logs deploy/tanzu-addons-controller-manager --since=1h | grep -i '<object name>'
+  ```
+
 - **Test the webhook lock** without publishing anything: mint a token for a service account
   that has RBAC on the kind, and attempt the create.
   ```sh
   kubectl -n <ns> create token <sa> --duration=10m   # build a kubeconfig with it
   # then, as that token, kubectl create the Addon/AddonRelease -> observe admission denial
   ```
-  If it succeeds, the webhook policy has been relaxed.
+  If it succeeds, the webhook policy has been relaxed. The Supervisor administrator cannot
+  grant itself these rights (RBAC escalation rules), so the practical probe is a throwaway
+  Supervisor Service: its kapp identity is privileged, it may ship a ClusterRole, and its
+  package can carry the objects inline (`fetch: [{inline: {paths: {...}}}]`, no image), so
+  the PackageInstall's `usefulErrorMessage` shows the webhook's answer. Template every
+  namespace from `data.values.namespace` (a ClusterRoleBinding subject included: kapp
+  rewrites `metadata.namespace` only), and pass the service no `namespace` value, since the
+  Supervisor fills it in. To remove it: uninstall, then
+  `PATCH .../supervisor-services/<svc>/versions/<v>?action=deactivate` and `DELETE` for each
+  version, then the same two for the service.
+- **Check the Supervisor's own rights first**, since they decide which probe is possible:
+  ```sh
+  for r in addons addonreleases addonconfigdefinitions addonrepositories addoninstalls; do
+    echo "$r $(kubectl auth can-i create $r.addons.kubernetes.vmware.com -n vmware-system-vks-public)"
+  done
+  ```
 - **Confirm an AddonRepository is frozen** before planning an upgrade path around it, with
   a server-side dry run that changes one field and applies nothing:
   ```sh
@@ -864,14 +1098,21 @@ You can learn a lot without a full build/upload cycle.
 
 - Want your own tenant-facing schema and to run on kapp-controller only: **imgpkg
   AddonRepository** with the ACD in the Package annotation. Accept the guest package fetch.
-- Fine with a helm-values interface and want a package-free AddonRelease: **helm
-  AddonRepository**. Accept the generated ACD and helm-controller dependency. Pick charts
-  and versions with `spec.addonFilters`, and still write the matching `package-offerings`
-  annotation — it is required of every AddonRepository, whatever the fetch.
+- Want a package-free AddonRelease delivered as a helm chart: **helm AddonRepository**,
+  with helm-controller as a dependency. On VKS 3.8, ship your own ACD in `Chart.yaml` to
+  give tenants a real schema with defaults; without it, or on 3.7, accept the generated
+  `helmValues`/`helmOptions` ACD. Pick charts and versions with `spec.addonFilters`. On 3.7
+  also write the matching `package-offerings` annotation (required there); on 3.8 a helm
+  repository needs none. On 3.8 the source may be an OCI registry (`oci://`).
 - Want single-upload delivery through the vCenter Services catalog: wrap the two
   AddonRepository CRs in a **Supervisor Service** (they land in the service namespace; the
-  manager still reconciles them). Build it with `kctrl package release` — it is a package
-  reference, not a repository. Otherwise just `kubectl apply` the two CRs.
+  manager still reconciles them). On VKS 3.8 this works for both flavours. On 3.7,
+  **imgpkg repositories only**: a helm repository in a service namespace never gets its
+  `HelmRepository` into the guests (see the namespace rewrite above), so register it in
+  `vmware-system-vks-public` instead. For a helm repository, add a kapp `rebaseRule` for
+  the labels the manager adds to the AddonRepositoryInstall, or the service's install goes
+  to `Reconcile failed` on its next sync. Build it with `kctrl package release` — it is a
+  package reference, not a repository. Otherwise just `kubectl apply` the two CRs.
 - Writing an ACD by copying a shipped one: **survey before you copy**. cilium is the
   reference everyone reaches for and two of its habits are not the norm — a duplicated
   values Secret on the Supervisor (3 ACDs of 103) and the RBAC that exists only to write
@@ -904,8 +1145,11 @@ You can learn a lot without a full build/upload cycle.
   (cert-manager is the common one): install it **as an addon**. `dependsOn` checks for the
   addon, so cert-manager delivered by your own GitOps or a Carvel `PackageInstall` leaves
   contour and windows-gmsa-webhook permanently unsatisfiable.
-- Tempted to create the Addon/AddonRelease yourself (Job, controller, apply): **do not**,
-  it is webhook-blocked by caller identity. Only the manager can, only via AddonRepository.
+- Tempted to create the Addon/AddonRelease/ACD yourself (Job, controller, apply,
+  Supervisor Service): **do not**, on VKS 3.8 with Supervisor 9.1.1.0 all three are
+  webhook-blocked, and the Supervisor administrator has no RBAC for them. Only the
+  manager can, only via AddonRepository. Direct creation by privileged users is planned for
+  a release after 3.8; re-test then (see the probes).
 
 ## Reference implementation
 
